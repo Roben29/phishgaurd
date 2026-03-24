@@ -1,0 +1,11 @@
+transformers 
+torch 
+xgboost 
+scikit-learn 
+pandas 
+numpy 
+beautifulsoup4 
+requests 
+lxml 
+tqdm
+beautifulsoup4
