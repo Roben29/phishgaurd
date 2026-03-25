@@ -9,3 +9,4 @@ requests
 lxml 
 tqdm
 beautifulsoup4
+bert-score

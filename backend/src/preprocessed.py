@@ -7,22 +7,49 @@ from urllib.parse import urlparse
 from collections import Counter
 from transformers import pipeline
 import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# -----------------------------
+# LOGGING
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-intent_model = pipeline(
+# -----------------------------
+# LOAD MODEL (ONCE)
+# -----------------------------
+phishing_model = pipeline(
     "text-classification",
-    model="distilbert-base-uncased-finetuned-sst-2-english"
+    model="cybersectony/phishing-email-detection-distilbert_v2.1"
 )
 
+# -----------------------------
+# REQUEST SESSION
+# -----------------------------
+session = requests.Session()
+retry = Retry(total=3, backoff_factor=1)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
+# -----------------------------
+# KEYWORD LIST (PHISHING SIGNAL)
+# -----------------------------
+phishing_keywords = [
+    "verify", "password", "login", "urgent", "account",
+    "bank", "update", "confirm", "secure", "click",
+    "limited", "suspended", "alert", "reset", "immediately"
+]
+
+# -----------------------------
+# URL FEATURES
+# -----------------------------
 def url_entropy(url):
     prob = [n_x / len(url) for x, n_x in Counter(url).items()]
-    entropy = -sum(p * np.log2(p) for p in prob)
-    return entropy
+    return -sum(p * np.log2(p) for p in prob)
 
 def extract_url_features(url):
-    logger.debug(f"Extracting URL features: {url}")
-
     parsed = urlparse(url)
 
     return {
@@ -32,32 +59,46 @@ def extract_url_features(url):
         "num_digits": sum(c.isdigit() for c in url),
         "has_at_symbol": int('@' in url),
         "has_ip": int(bool(re.search(r'\d+\.\d+\.\d+\.\d+', url))),
-        "num_subdomains": len(parsed.netloc.split('.')) - 2,
-        "entropy": url_entropy(url)
+        "num_subdomains": max(len(parsed.netloc.split('.')) - 2, 0),
+        "entropy": url_entropy(url),
     }
 
+# -----------------------------
+# SCRAPE HTML
+# -----------------------------
 def scrape_html(url):
     try:
-        logger.info(f"Scraping started: {url}")
+        res = session.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "en-US,en;q=0.9"
+            }
+        )
 
-        res = requests.get(url, timeout=5)
+        if res.status_code >= 400:
+            return None, ""
+
         soup = BeautifulSoup(res.text, "html.parser")
 
         for tag in soup(["script", "style"]):
             tag.decompose()
 
-        text = soup.get_text(separator=" ")
+        text = soup.get_text(separator=" ").lower()
+        text = " ".join(text.split())
 
-        logger.info(f"Scraping success: {url}")
-        return soup, text.strip()
+        return soup, text[:1000]
 
     except Exception as e:
-        logger.error(f"Scraping failed: {url} | Error: {e}")
-        return None, None
+        logger.warning(f"Scraping failed: {url} | {e}")
+        return None, ""
 
+# -----------------------------
+# HTML FEATURES
+# -----------------------------
 def extract_html_features(soup):
     if soup is None:
-        logger.warning("Soup is None, returning default HTML features")
         return {
             "num_forms": 0,
             "num_inputs": 0,
@@ -65,61 +106,43 @@ def extract_html_features(soup):
             "num_iframes": 0
         }
 
-    forms = soup.find_all("form")
-    inputs = soup.find_all("input")
-    iframes = soup.find_all("iframe")
-
-    password_fields = soup.find_all("input", {"type": "password"})
-
-    logger.debug(f"HTML features extracted: forms={len(forms)}, inputs={len(inputs)}")
-
     return {
-        "num_forms": len(forms),
-        "num_inputs": len(inputs),
-        "has_password": int(len(password_fields) > 0),
-        "num_iframes": len(iframes)
+        "num_forms": len(soup.find_all("form")),
+        "num_inputs": len(soup.find_all("input")),
+        "has_password": int(len(soup.find_all("input", {"type": "password"})) > 0),
+        "num_iframes": len(soup.find_all("iframe"))
     }
 
-phishing_keywords = [
-    "login","verify","account","bank","password","update","secure","confirm","urgent","payment",
-    "username","credential","identity","profile","email","userid","authenticate","validation","registered",
-    "immediately","suspended","limited","expire","restricted","warning","alert","critical","required","action",
-    "billing","transaction","refund","invoice","credit","debit","wallet","wire","transfer","checkout",
-    "protection","encrypted","official","compliance","authorized","trusted","certificate","2fa","otp","verification",
-    "click","submit","access","unlock","reactivate","respond","review","complete","proceed","resolve",
-    "support","helpdesk","notification","service","admin","customer","prize","reward","gift",
-    "redirect","portal","token","session","reset","recovery","signin","logon","webmail",
-    "free","winner","won","congratulations","selected","exclusive","offer","deal","discount","promo",
-    "coupon","cashback","bonus","claim","redeem","giveaway","jackpot","lottery","sweepstakes","eligible",
-    "limited-time","special","savings","trial","subscription","voucher","points","rebate","unlock","granted",
-]
-
+# -----------------------------
+# KEYWORD SCORE
+# -----------------------------
 def keyword_score(text):
-    text = text.lower()
-    score = sum(word in text for word in phishing_keywords)
-    logger.debug(f"Keyword score: {score}")
-    return score
-
-def bert_intent_score(text):
     if not text:
-        logger.warning("Empty text for BERT scoring")
+        return 0
+
+    count = sum(1 for word in phishing_keywords if word in text)
+    return count / len(phishing_keywords)
+
+# -----------------------------
+# BERT SCORE (DISTILBERT OUTPUT)
+# -----------------------------
+def bert_score(text):
+    if not text or len(text) < 20:
         return 0
 
     try:
-        text = text[:512]
-        result = intent_model(text)[0]
-
-        logger.debug(f"BERT result: {result}")
-
-        return result["score"]
+        result = phishing_model(text[:512])[0]
+        prob = result["score"] if "phishing" in result["label"].lower() else 1 - result["score"]
+        return prob
 
     except Exception as e:
-        logger.error(f"BERT failed | Error: {e}")
+        logger.warning(f"BERT failed: {e}")
         return 0
 
+# -----------------------------
+# MAIN FEATURE EXTRACTION
+# -----------------------------
 def extract_features(url):
-    logger.info(f"Processing URL: {url}")
-
     features = {}
 
     try:
@@ -129,86 +152,67 @@ def extract_features(url):
 
         features.update(extract_html_features(soup))
 
-        features["keyword_score"] = keyword_score(text if text else "")
-        features["bert_score"] = bert_intent_score(text)
-
-        logger.info(f"Completed URL: {url}")
+        # ✅ ONLY REQUIRED FEATURES
+        features["keyword_score"] = keyword_score(text)
+        features["bert_score"] = bert_score(text)
 
     except Exception as e:
-        logger.error(f"Feature extraction failed: {url} | Error: {e}")
+        logger.error(f"Feature extraction failed: {url} | {e}")
 
     return features
 
+# -----------------------------
+# NORMALIZE URL
+# -----------------------------
 def normalize_url(url):
     url = url.strip()
 
-    if not url.startswith("http://") and not url.startswith("https://"):
+    if not url or url.lower() == "url":
+        return None
+
+    if not url.startswith("http"):
         url = "http://" + url
 
     return url
 
-def process_csv(input_file, output_file):
-    logger.info("CSV processing started")
+# -----------------------------
+# CSV PROCESSING (STRICT ORDER)
+# -----------------------------
+FIELDS = [
+    "url_length", "num_dots", "num_hyphens", "num_digits",
+    "has_at_symbol", "has_ip", "num_subdomains", "entropy",
+    "num_forms", "num_inputs", "has_password", "num_iframes",
+    "keyword_score", "bert_score"
+]
 
+def process_csv(input_file, output_file):
     total = 0
 
     with open(input_file, "r", encoding="utf-8") as infile, \
          open(output_file, "w", newline='', encoding="utf-8") as outfile:
 
         reader = csv.reader(infile)
-        writer = None
+        next(reader, None)
 
-        for row in reader:
-            total += 1
-            url = normalize_url(row[0])
-
-            try:
-                features = extract_features(url)
-
-                if writer is None:
-                    writer = csv.DictWriter(outfile, fieldnames=features.keys())
-                    writer.writeheader()
-
-                writer.writerow(features)
-
-            except Exception as e:
-                logger.error(f"Row failed: {url} | Error: {e}")
-
-            if total % 50 == 0:
-                logger.info(f"Processed {total} URLs")
-
-    logger.info("Feature extraction completed")
-
-def remove_zero_bert_rows(file_path):
-    import csv
-    import os
-
-    temp_file = file_path + ".tmp"
-
-    kept = 0
-    removed = 0
-
-    with open(file_path, "r", encoding="utf-8") as infile, \
-         open(temp_file, "w", newline='', encoding="utf-8") as outfile:
-
-        reader = csv.DictReader(infile)
-        writer = csv.DictWriter(outfile, fieldnames=reader.fieldnames)
-
+        writer = csv.DictWriter(outfile, fieldnames=FIELDS)
         writer.writeheader()
 
         for row in reader:
-            try:
-                bert_score = float(row.get("bert_score", 0))
+            url = normalize_url(row[0])
 
-                if bert_score != 0:
-                    writer.writerow(row)
-                    kept += 1
-                else:
-                    removed += 1
+            if not url:
+                continue
 
-            except Exception as e:
-                removed += 1
+            total += 1
 
-    os.replace(temp_file, file_path)
+            features = extract_features(url)
 
-    logger.info(f"BERT filter applied → Kept: {kept}, Removed: {removed}")
+            # ensure all fields exist
+            row_data = {key: features.get(key, 0) for key in FIELDS}
+
+            writer.writerow(row_data)
+
+            if total % 20 == 0:
+                logger.info(f"Processed {total} URLs")
+
+    logger.info("✅ Feature extraction completed")
