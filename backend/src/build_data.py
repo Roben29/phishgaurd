@@ -10,41 +10,26 @@ import logging
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# -----------------------------
-# LOGGING
-# -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# LOAD MODEL (ONCE)
-# -----------------------------
 phishing_model = pipeline(
     "text-classification",
     model="cybersectony/phishing-email-detection-distilbert_v2.1"
 )
 
-# -----------------------------
-# REQUEST SESSION
-# -----------------------------
 session = requests.Session()
 retry = Retry(total=3, backoff_factor=1)
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# -----------------------------
-# KEYWORD LIST (PHISHING SIGNAL)
-# -----------------------------
 phishing_keywords = [
     "verify", "password", "login", "urgent", "account",
     "bank", "update", "confirm", "secure", "click",
     "limited", "suspended", "alert", "reset", "immediately"
 ]
 
-# -----------------------------
-# URL FEATURES
-# -----------------------------
 def url_entropy(url):
     prob = [n_x / len(url) for x, n_x in Counter(url).items()]
     return -sum(p * np.log2(p) for p in prob)
@@ -63,9 +48,6 @@ def extract_url_features(url):
         "entropy": url_entropy(url),
     }
 
-# -----------------------------
-# SCRAPE HTML
-# -----------------------------
 def scrape_html(url):
     try:
         res = session.get(
@@ -94,9 +76,6 @@ def scrape_html(url):
         logger.warning(f"Scraping failed: {url} | {e}")
         return None, ""
 
-# -----------------------------
-# HTML FEATURES
-# -----------------------------
 def extract_html_features(soup):
     if soup is None:
         return {
@@ -113,9 +92,6 @@ def extract_html_features(soup):
         "num_iframes": len(soup.find_all("iframe"))
     }
 
-# -----------------------------
-# KEYWORD SCORE
-# -----------------------------
 def keyword_score(text):
     if not text:
         return 0
@@ -123,9 +99,6 @@ def keyword_score(text):
     count = sum(1 for word in phishing_keywords if word in text)
     return count / len(phishing_keywords)
 
-# -----------------------------
-# BERT SCORE (DISTILBERT OUTPUT)
-# -----------------------------
 def bert_score(text):
     if not text or len(text) < 20:
         return 0
@@ -139,9 +112,6 @@ def bert_score(text):
         logger.warning(f"BERT failed: {e}")
         return 0
 
-# -----------------------------
-# MAIN FEATURE EXTRACTION
-# -----------------------------
 def extract_features(url):
     features = {}
 
@@ -152,7 +122,6 @@ def extract_features(url):
 
         features.update(extract_html_features(soup))
 
-        # ✅ ONLY REQUIRED FEATURES
         features["keyword_score"] = keyword_score(text)
         features["bert_score"] = bert_score(text)
 
@@ -161,9 +130,6 @@ def extract_features(url):
 
     return features
 
-# -----------------------------
-# NORMALIZE URL
-# -----------------------------
 def normalize_url(url):
     url = url.strip()
 
@@ -175,9 +141,6 @@ def normalize_url(url):
 
     return url
 
-# -----------------------------
-# CSV PROCESSING (STRICT ORDER)
-# -----------------------------
 FIELDS = [
     "url_length", "num_dots", "num_hyphens", "num_digits",
     "has_at_symbol", "has_ip", "num_subdomains", "entropy",
@@ -207,7 +170,6 @@ def process_csv(input_file, output_file):
 
             features = extract_features(url)
 
-            # ensure all fields exist
             row_data = {key: features.get(key, 0) for key in FIELDS}
 
             writer.writerow(row_data)
@@ -215,4 +177,4 @@ def process_csv(input_file, output_file):
             if total % 20 == 0:
                 logger.info(f"Processed {total} URLs")
 
-    logger.info("✅ Feature extraction completed")
+    logger.info("Feature extraction completed")
